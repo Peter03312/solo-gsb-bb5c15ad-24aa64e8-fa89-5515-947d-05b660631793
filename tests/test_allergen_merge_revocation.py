@@ -29,7 +29,8 @@ def client():
     conn = db.connect()
     for t in ["material_declarations", "material_batches", "processing_inputs",
               "processing_outputs", "processings", "cleanings", "labels",
-              "trace_events", "investigations", "allergen_code_merges"]:
+              "trace_events", "investigations", "label_applications",
+              "allergen_code_merges"]:
         conn.execute(f"DELETE FROM {t}")
     conn.execute("DELETE FROM sqlite_sequence WHERE name = 'trace_events'")
     conn.execute("DELETE FROM sqlite_sequence WHERE name = 'allergen_code_merges'")
@@ -50,6 +51,19 @@ def processing(c, pid, eq, start, end, inputs, outputs):
         "processing_id": pid, "equipment_id": eq,
         "start_utc": start, "end_utc": end,
         "inputs": inputs, "outputs": outputs})
+
+def issue_label(c, batch_id):
+    """走完审批流签发标签：申请（当前游标）-> 批准 -> 签发。"""
+    cursor = c.get("/changes/snapshot").json()["cursor"]
+    app = c.post("/label-applications", json={
+        "batch_id": batch_id, "applicant": "qc-1",
+        "reason": "例行放行审核", "cursor": cursor})
+    assert app.status_code == 201, app.text
+    aid = app.json()["application_id"]
+    r = c.post(f"/label-applications/{aid}/approve", json={"reviewer": "qa-1"})
+    assert r.status_code == 200, r.text
+    return c.post(f"/batches/{batch_id}/labels", json={"application_id": aid})
+
 
 
 def merge(c, old, target, reason="同义词并码"):
@@ -247,9 +261,9 @@ def test_revoke_keeps_declaration_versions_and_label_snapshots(client):
     processing(client, "P1", "EQ-1",
                "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
                ["RM-1"], ["OUT-1"])
-    lab = client.post("/batches/OUT-1/labels", json={}).json()
+    lab = issue_label(client, "OUT-1").json()
     mid = merge(client, "casein", "milk").json()["merge_id"]
-    lab2 = client.post("/batches/OUT-1/labels", json={}).json()
+    lab2 = issue_label(client, "OUT-1").json()
     assert lab2["conclusion"]["allergens"] == ["milk"]
     revoke(client, mid)
     # 两张已签发标签各自保持签发时快照
@@ -260,7 +274,7 @@ def test_revoke_keeps_declaration_versions_and_label_snapshots(client):
     # 原料声明原始代码不变
     assert client.get("/materials/RM-1").json()["allergens"] == ["casein"]
     # 撤销后新签发标签按撤销后的口径
-    lab3 = client.post("/batches/OUT-1/labels", json={}).json()
+    lab3 = issue_label(client, "OUT-1").json()
     assert lab3["conclusion"]["allergens"] == ["casein"]
 
 

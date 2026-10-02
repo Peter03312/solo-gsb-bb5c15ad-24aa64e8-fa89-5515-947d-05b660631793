@@ -20,7 +20,7 @@ def client():
     conn = db.connect()
     for t in ["material_declarations", "material_batches", "processing_inputs",
               "processing_outputs", "processings", "cleanings", "labels",
-              "trace_events", "allergen_code_merges"]:
+              "trace_events", "label_applications", "allergen_code_merges"]:
         conn.execute(f"DELETE FROM {t}")
     conn.execute("DELETE FROM sqlite_sequence WHERE name = 'trace_events'")
     conn.close()
@@ -43,6 +43,22 @@ def processing(c, pid, eq, start, end, inputs, outputs):
 
 def correct_inputs(c, pid, inputs):
     return c.post(f"/processings/{pid}/inputs/correction", json={"inputs": inputs})
+
+
+def issue_label(c, batch_id, supersedes_id=None):
+    """走完审批流签发标签：申请（当前游标）-> 批准 -> 签发。"""
+    cursor = c.get("/changes/snapshot").json()["cursor"]
+    app = c.post("/label-applications", json={
+        "batch_id": batch_id, "applicant": "qc-1",
+        "reason": "例行放行审核", "cursor": cursor})
+    assert app.status_code == 201, app.text
+    aid = app.json()["application_id"]
+    r = c.post(f"/label-applications/{aid}/approve", json={"reviewer": "qa-1"})
+    assert r.status_code == 200, r.text
+    body = {"application_id": aid}
+    if supersedes_id is not None:
+        body["supersedes_id"] = supersedes_id
+    return c.post(f"/batches/{batch_id}/labels", json=body)
 
 
 # ---------------------------------------------------------------- 基础登记与校验
@@ -267,7 +283,7 @@ def test_declaration_correction_recomputes_live(client):
 def test_label_frozen_and_superseded(client):
     _build_line(client)
     # 签发标签
-    r = client.post("/batches/OUT-2/labels", json={})
+    r = issue_label(client, "OUT-2")
     assert r.status_code == 201
     label1 = r.json()
     assert label1["conclusion"]["allergens"] == ["gluten", "milk"]
@@ -284,8 +300,7 @@ def test_label_frozen_and_superseded(client):
     live = client.get("/batches/OUT-2/trace").json()
     assert live["allergens"] == ["gluten", "sesame"]
     # 签发关联旧版的新标签
-    r = client.post("/batches/OUT-2/labels",
-                    json={"supersedes_id": label1["label_id"]})
+    r = issue_label(client, "OUT-2", supersedes_id=label1["label_id"])
     assert r.status_code == 201
     label2 = r.json()
     assert label2["supersedes_id"] == label1["label_id"]
@@ -304,19 +319,34 @@ def test_label_frozen_and_superseded(client):
 def test_label_supersedes_validation(client):
     _build_line(client)
     material(client, "RM-X")
-    l1 = client.post("/batches/OUT-2/labels", json={}).json()
+    l1 = issue_label(client, "OUT-2").json()
+
+    def approved_application(batch_id):
+        cursor = client.get("/changes/snapshot").json()["cursor"]
+        aid = client.post("/label-applications", json={
+            "batch_id": batch_id, "applicant": "qc-1",
+            "reason": "例行放行审核", "cursor": cursor
+        }).json()["application_id"]
+        client.post(f"/label-applications/{aid}/approve",
+                    json={"reviewer": "qa-1"})
+        return aid
+
     # 旧标签属于别的批次 -> 拒绝
     r = client.post("/batches/RM-X/labels",
-                    json={"supersedes_id": l1["label_id"]})
+                    json={"application_id": approved_application("RM-X"),
+                          "supersedes_id": l1["label_id"]})
     assert r.status_code == 400
     # 旧标签不存在
-    assert client.post("/batches/RM-X/labels",
-                       json={"supersedes_id": 999}).status_code == 404
+    r = client.post("/batches/RM-X/labels",
+                    json={"application_id": approved_application("RM-X"),
+                          "supersedes_id": 999})
+    assert r.status_code == 404
 
 
 def test_unknown_batch_404(client):
     assert client.get("/batches/NOPE/trace").status_code == 404
-    assert client.post("/batches/NOPE/labels", json={}).status_code == 404
+    assert client.post("/batches/NOPE/labels",
+                       json={"application_id": 1}).status_code == 404
 
 
 # ---------------------------------------------------------------- 加工投入纠正
@@ -485,7 +515,7 @@ def test_correct_inputs_keeps_issued_label_snapshot(client):
     assert processing(client, "P1", "EQ-1",
                       "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
                       ["RM-WRONG"], ["OUT-1"]).status_code == 201
-    label = client.post("/batches/OUT-1/labels", json={}).json()
+    label = issue_label(client, "OUT-1").json()
     # 纠正投入：sesame -> gluten（实时结论改变）
     assert correct_inputs(client, "P1", ["RM-RIGHT"]).status_code == 200
     assert client.get("/batches/OUT-1/trace").json()["allergens"] == ["gluten"]
@@ -493,8 +523,8 @@ def test_correct_inputs_keeps_issued_label_snapshot(client):
     frozen = client.get(f"/labels/{label['label_id']}").json()
     assert frozen["conclusion"]["allergens"] == ["sesame"]
     # 纠正后签发的新标签反映新实时结论
-    label2 = client.post("/batches/OUT-1/labels",
-                         json={"supersedes_id": label["label_id"]}).json()
+    label2 = issue_label(client, "OUT-1",
+                         supersedes_id=label["label_id"]).json()
     assert label2["conclusion"]["allergens"] == ["gluten"]
 
 
@@ -503,7 +533,7 @@ def test_correct_inputs_keeps_issued_label_snapshot(client):
 def test_declaration_preview_is_dry_run_and_reports_diffs(client):
     _build_line(client)  # EQ-1: P1(RM-MILK->OUT-1), P2(RM-OAT->OUT-2)，无清洗
     # 预演前签发标签：冻结 gluten + milk
-    label = client.post("/batches/OUT-2/labels", json={}).json()
+    label = issue_label(client, "OUT-2").json()
     r = client.post("/materials/RM-OAT/declarations/preview",
                     json={"allergens": ["gluten", "sesame"]})
     assert r.status_code == 200, r.text
@@ -595,7 +625,7 @@ def test_preview_credential_invalidated_by_new_label(client):
     token = client.post("/materials/RM-OAT/declarations/preview",
                         json={"allergens": ["sesame"]}).json()["preview_id"]
     # 受影响批次上新签发标签 -> 标签差异集合变化，凭据失效
-    assert client.post("/batches/OUT-2/labels", json={}).status_code == 201
+    assert issue_label(client, "OUT-2").status_code == 201
     assert client.post(f"/previews/{token}/commit").status_code == 409
 
 
@@ -605,7 +635,7 @@ def test_revoke_preview_reports_residue_propagation_and_commit(client):
         "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
         "verified": True}).json()["id"]
     # 清洗生效时签发标签（仅 gluten）
-    label_id = client.post("/batches/OUT-2/labels", json={}).json()["label_id"]
+    label_id = issue_label(client, "OUT-2").json()["label_id"]
     # 再加第三道加工：撤销清洗后残留沿 OUT-1 -> OUT-2 -> OUT-3 继续传播
     assert processing(client, "P3", "EQ-1",
                       "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z",
@@ -837,7 +867,7 @@ def test_cleaning_events_only_when_trace_changes(client):
 def test_label_issuance_produces_no_events(client):
     _build_line(client)
     cursor = _cursor(client)
-    assert client.post("/batches/OUT-2/labels", json={}).status_code == 201
+    assert issue_label(client, "OUT-2").status_code == 201
     assert _events(client, cursor)["events"] == []
 
 

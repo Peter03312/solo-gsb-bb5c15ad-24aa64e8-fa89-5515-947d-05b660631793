@@ -14,8 +14,12 @@
   这些批次**已签发标签**相对变更前后实时结论的差异，以及一次性提交凭据；
   提交时若影响差异的记录已变化则拒绝（需重新预演），无关记录更新不使凭据失效；
 - 原料声明更正、清洗撤销后，**未签发结论按当前有效记录实时重算**；
-- **签发标签**冻结签发时刻的结论与依据，后续变更不改旧标签，
-  可签发关联旧版（`supersedes_id`）的新标签；
+- **标签签发纳入可审计的审批环节**：质控提交签发申请（批次号、申请人、
+  审批理由、拟签发标签备注、当前溯源游标），系统冻结并返回申请时刻的
+  实时结论、依据摘要与封存状态；审核人仅在申请仍对应同一批次结论且未
+  封存时批准或驳回；**批准后凭申请签发标签**（绑定批准记录、冻结申请时
+  结论，一个批准只能签发一张标签），驳回或结论/封存变化禁止签发、需重新
+  申请；已签发标签快照永不可变，可签发关联旧版（`supersedes_id`）的新标签；
 - **变更事件订阅**：下游按游标增量同步——初始化读取返回同一状态下的现存批次
   实时结论与游标，之后分页读取事件（全局递增序号、触发操作、批次号、变更前后
   完整结论与依据）；业务写入与事件同事务，失败/预演/无实际变化不产事件；
@@ -94,8 +98,10 @@ pytest tests/ -q
   且两次加工之间没有 `verified=true 且未撤销` 的清洗
   （`上次 end_utc ≤ cleaned_at ≤ 本次 start_utc`），
   则上一次加工产出的全部过敏原/待确认状态作为残留继承。
-- **标签**：签发时将结论（每项过敏原/待确认的来源路径）与依据
-  （命中的原料声明版本、赖以清除残留的清洗记录）整体冻结为快照，永不可变。
+- **标签**：签发前须经“申请 -> 批准”审批环节；签发时冻结**申请时刻**的
+  结论与依据为快照（永不可变），并绑定批准记录（`application_id`）与申请
+  备注（`note`）。审批流上线前签发的历史标签两字段为 `null`，快照与查询
+  结构保持兼容。
 - **过敏原代码并码**：`allergen_code_merges` 记录 `旧代码 -> 目标代码`（必填
   原因），每个旧代码至多一条**生效中**的记录（部分唯一索引）；目标自身可再被
   并码形成串接链。记录可凭记录号**撤销**（`revoked=1` + 必填撤销原因 + 撤销
@@ -127,8 +133,12 @@ pytest tests/ -q
 | POST | `/investigations` | 登记疑似交叉接触调查封存（批次号 + 唯一调查号 + 原因） |
 | GET | `/investigations` / `/investigations/{id}` | 查询调查（可按 `?status=open/lifted` 过滤）及受影响批次/路径 |
 | POST | `/investigations/{id}/lift` | 解除调查封存（仅移除该调查自身的影响；重复解除报错） |
-| POST | `/batches/{batch_id}/labels` | 签发标签（封存批次拒绝；可带 `supersedes_id` 关联旧版） |
-| GET | `/batches/{batch_id}/labels` / `/labels/{id}` | 查询标签 |
+| POST | `/label-applications` | 提交标签签发申请（批次号+申请人+审批理由+备注+溯源游标；同一未决申请重复提交幂等） |
+| GET | `/label-applications` / `/label-applications/{id}` | 查询签发申请（可按 `?status=pending/approved/rejected`、`?batch_id=` 过滤） |
+| POST | `/label-applications/{id}/approve` | 批准签发申请（仅当申请仍对应同一批次结论且未封存；已处理不可重复审批） |
+| POST | `/label-applications/{id}/reject` | 驳回签发申请（同时效校验；驳回后禁止签发，需重新申请） |
+| POST | `/batches/{batch_id}/labels` | 签发标签（必须绑定已批准申请 `application_id`，冻结申请时结论；可带 `supersedes_id`） |
+| GET | `/batches/{batch_id}/labels` / `/labels/{id}` | 查询标签（附批准记录与备注；历史标签兼容） |
 | GET | `/changes/snapshot` | 初始化读取：同一状态下的现存批次实时结论 + 游标 |
 | GET | `/changes/events` | 按游标分页读取变更事件（固定上界，无效游标拒绝） |
 | POST | `/allergen-merges` | 登记过敏原代码并码（旧代码 + 目标代码 + 必填原因；同向重试幂等，撤销后可重新并码） |
@@ -138,12 +148,16 @@ pytest tests/ -q
 | GET | `/allergen-codes/{code}` | 查询代码：按**生效链**给出最终规范代码 `canonical_code` 与并码沿革 `history` |
 
 错误约定：`400` 无效时序/参数（如投入批次在加工开始前不可用、无效游标、
-登记调查时批次未知、非法 `status` 过滤、并码旧代码未在任何现存声明中出现）；
+登记调查时批次未知、非法 `status` 过滤、并码旧代码未在任何现存声明中出现、
+签发申请批次未知、签发申请与目标批次不符）；
 `404` 资源不存在；`409` 冲突（设备时间重叠、来源环、批次号占用、重复撤销、
-重复调查号、重复解除、对封存批次签发标签或以封存批次/受封存残留登记新加工、
+重复调查号、重复解除、对封存批次审批签发申请或以封存批次/受封存残留登记新加工、
 预演凭据不存在/已使用/已过期，或影响差异的记录已变化需重新预演；并码自映射、
-目标当前为别名、同一旧代码生效中改指其他目标、并码记录重复撤销）；
-`422` 请求格式错误（如时间缺少时区、调查字段为空白、并码/撤销原因为空白）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
+目标当前为别名、同一旧代码生效中改指其他目标、并码记录重复撤销；
+签发申请游标过期、申请已处理重复审批、申请结论/依据/封存状态已变化、
+未批准/已驳回/已使用批准的签发）；
+`422` 请求格式错误（如时间缺少时区、调查字段为空白、并码/撤销原因为空白、
+签发申请缺少申请人/审批理由、签发缺少 `application_id`）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
 
 ## 变更预演（dry-run）与凭据提交
 
@@ -359,11 +373,18 @@ curl -s $BASE/materials/RM-OAT/declarations/preview -X POST \
   -d '{"allergens": ["gluten", "sesame", "soy"]}'
 # -> 返回 preview_id 后：curl -s $BASE/previews/<preview_id>/commit -X POST
 
-# 7. 签发标签（冻结当前结论）；变更后签发关联旧版的新标签
+# 7. 签发标签（审批流：申请 -> 批准 -> 签发，冻结申请时结论）
+CURSOR=$(curl -s $BASE/changes/snapshot | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')
+curl -s $BASE/label-applications -X POST -H 'Content-Type: application/json' -d "{
+  \"batch_id\": \"OUT-OAT-1\", \"applicant\": \"qc-zhang\",
+  \"reason\": \"例行放行审核\", \"note\": \"2026 年第 3 批\", \"cursor\": $CURSOR}"
+curl -s $BASE/label-applications/1/approve -X POST \
+  -H 'Content-Type: application/json' -d '{"reviewer": "qa-li"}'
 curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
-  -H 'Content-Type: application/json' -d '{}'
+  -H 'Content-Type: application/json' -d '{"application_id": 1}'
+# 变更后重新走审批流，签发关联旧版的新标签
 curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
-  -H 'Content-Type: application/json' -d '{"supersedes_id": 1}'
+  -H 'Content-Type: application/json' -d '{"application_id": 2, "supersedes_id": 1}'
 curl -s $BASE/labels/1   # 旧标签保持签发时的结论不变
 ```
 
@@ -470,6 +491,80 @@ curl -s $BASE/allergen-merges -X POST -H 'Content-Type: application/json' \
 
 完整专项演示脚本：`./examples/demo_merges.sh`
 
+## 标签签发审批（可审计）
+
+标签签发纳入“**申请 -> 审批 -> 签发**”的可审计流程，未批准一律不能签发：
+
+```
+POST /label-applications
+{"batch_id": "OUT-OAT-1", "applicant": "qc-zhang", "reason": "例行放行审核",
+ "note": "2026 年第 3 批燕麦奶标签", "cursor": 14}
+```
+
+规则：
+
+- **提交申请**：质控提交批次号、申请人、审批理由、拟签发标签备注（可空）
+  与**当前溯源游标**（`GET /changes/snapshot` 的 `cursor`）。系统保存申请
+  并**冻结申请时刻的实时结论（过敏原/待确认/来源路径）、依据摘要与封存
+  状态**随响应返回（`status=pending`）。
+  - 游标须等于当前最大事件序号：游标之后已有新变更即**过期结论**（`409`），
+    需重新读取快照后提交；无效游标（越界）`400`、未知批次 `400`、
+    缺少申请人/理由 `422`；
+  - **重复提交同一未决申请幂等**：批次/申请人/理由/备注/游标完全一致且
+    申请仍 `pending` 时返回原申请（HTTP `200`、`"replayed": true`），
+    不重复建行；任一字段不同或原申请已处理则为新申请（`201`）。
+- **审批**（`POST /label-applications/{id}/approve` / `/reject`，审核人
+  必填、审核意见可空）：审核人**只能在申请仍对应同一批次结论/依据/封存
+  状态且批次未封存时**批准或驳回；申请失效（`stale=true`）或批次封存
+  一律 `409`；**已处理（已批准/已驳回）申请不可重复审批**（`409`），
+  未知申请 `404`。
+- **签发**（`POST /batches/{batch_id}/labels`，`application_id` 必填）：
+  - 申请须**已批准**且属于本批次：未决 `409`、已驳回 `409`（需重新申请）、
+    批次不符 `400`、未知申请 `404`、缺少 `application_id` `422`；
+  - 签发时再次核对实时结论/依据/封存状态与申请时冻结值一致且未封存——
+    **驳回或结论/封存变化禁止签发并要求重新申请**（`409`）；
+  - 签发**绑定批准记录**（标签带 `application_id` 与申请备注 `note`）并
+    **冻结申请时结论**为快照；**一个批准只能签发一张标签**（再次签发
+    `409`），如需新标签须重新申请；`supersedes_id` 关联旧版的用法不变。
+- **封存约束**：封存批次仍可提交申请（响应如实返回 `release.held` 与
+  生效调查），但**审批与签发均被拒绝**；解除封存后原申请因封存状态变化
+  已失效（`stale=true`），需重新申请。
+- **审计查询**：`GET /label-applications`（可按 `?status=`、`?batch_id=`
+  过滤）与 `GET /label-applications/{id}` 返回申请全貌：冻结结论/依据/
+  封存、状态、申请人/审核人/时间、绑定标签号，以及 `stale`（实时结论是
+  否已偏离申请时冻结）。
+- **兼容性**：申请/审批/签发均不改变实时溯源，**不产生变更事件**；
+  既有标签快照结构（`conclusion`/`basis`）不变，标签查询仅**新增**
+  `application_id`/`note` 两字段（审批流上线前签发的历史标签为 `null`）；
+  旧版库启动时自动幂等迁移（`labels` 补两列），无需人工干预。
+
+```bash
+BASE=http://localhost:8000
+
+# 1) 提交签发申请（游标取自 /changes/snapshot），返回冻结的实时结论/依据/封存
+CURSOR=$(curl -s $BASE/changes/snapshot | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')
+curl -s $BASE/label-applications -X POST -H 'Content-Type: application/json' -d "{
+  \"batch_id\": \"OUT-OAT-1\", \"applicant\": \"qc-zhang\",
+  \"reason\": \"例行放行审核\", \"note\": \"2026 年第 3 批\", \"cursor\": $CURSOR}"
+# -> {"application_id": 1, "status": "pending", "conclusion": {...}, "basis": {...},
+#     "release": {"held": false, ...}, "stale": false, ...}
+
+# 2) 审核人批准（或 /reject 驳回）；已处理申请再审批 -> 409
+curl -s $BASE/label-applications/1/approve -X POST \
+  -H 'Content-Type: application/json' -d '{"reviewer": "qa-li", "note": "结论与放行单一致"}'
+
+# 3) 凭批准记录签发标签（绑定 application_id，冻结申请时结论与备注）
+curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
+  -H 'Content-Type: application/json' -d '{"application_id": 1}'
+# 同一批准再次签发 -> 409；结论/封存变化后签发 -> 409 需重新申请
+
+# 4) 审计查询
+curl -s "$BASE/label-applications?status=approved"
+curl -s $BASE/labels/1   # 标签附 application_id 与 note；历史标签为 null
+```
+
+完整专项演示脚本：`./examples/demo_label_approval.sh`
+
 ## 调查封存（疑似交叉接触）
 
 质控人员发现疑似交叉接触时，以**批次号、唯一调查号、原因**登记调查：
@@ -500,7 +595,8 @@ POST /investigations
   其他调查仍封存的批次保持封存。重复调查号 `409`、未知调查号解除 `404`、
   重复解除 `409`、登记时未知批次 `400`、空白字段 `422`。
 - **封存约束（校验与写入同一事务，失败回滚不留痕）**：
-  - 封存批次**不得签发新标签**（`409`）；旧标签快照不变，解除后可再签；
+  - 封存批次**不得审批/签发标签**（`409`；申请可登记并如实返回封存状态，
+    解除封存后原申请因封存状态变化失效，需重新申请）；旧标签快照不变；
   - 封存批次**不得作为新加工投入**（`409`）；
   - 新加工在同设备上会继承到封存批次的残留、且两次加工间无有效清洗截断时，
     **登记同样拒绝**（`409`，错误信息指明封存残留批次），不留下加工或标签。
@@ -527,8 +623,13 @@ curl -s $BASE/investigations -X POST -H 'Content-Type: application/json' -d '{
 # 按批次查询放行状态、仍生效调查号与传播路径
 curl -s $BASE/batches/OUT-OAT-1/release
 
-# 封存批次的标签/新加工被拒绝（409，原子失败不留痕）
-curl -i -s $BASE/batches/OUT-OAT-1/labels -X POST -H 'Content-Type: application/json' -d '{}'
+# 封存批次的标签审批/新加工被拒绝（409，原子失败不留痕）
+CURSOR=$(curl -s $BASE/changes/snapshot | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')
+curl -s $BASE/label-applications -X POST -H 'Content-Type: application/json' -d "{
+  \"batch_id\": \"OUT-OAT-1\", \"applicant\": \"qc-zhang\",
+  \"reason\": \"例行放行审核\", \"cursor\": $CURSOR}"   # 申请可登记，返回封存状态
+curl -s $BASE/label-applications/1/approve -X POST \
+  -H 'Content-Type: application/json' -d '{"reviewer": "qa-li"}'   # -> 409 封存
 
 # 登记有效清洗截断残留（同步重算，可能解除下游封存）或解除调查（只移除该调查影响）
 curl -s $BASE/investigations/INV-2026-001/lift -X POST
@@ -539,15 +640,17 @@ curl -s $BASE/investigations/INV-2026-001/lift -X POST
 ```
 app/
   main.py      # FastAPI 路由与错误映射
-  service.py   # 业务规则：校验、溯源计算、代码并码规范化与撤销、调查封存传播、标签签发、变更预演、变更事件流
+  service.py   # 业务规则：校验、溯源计算、代码并码规范化与撤销、调查封存传播、标签签发审批、变更预演、变更事件流
   db.py        # SQLite 连接、建表与旧结构幂等迁移、写/读事务
   schemas.py   # 请求模型（强制时区感知时间）
 tests/test_app.py            # 45 个端到端测试（溯源/清洗/纠正/预演/标签/事件流）
 tests/test_investigations.py # 19 个调查封存端到端测试（传播/截断/叠加/约束/事件/乱序补登）
 tests/test_allergen_merges.py # 19 个并码端到端测试（校验/幂等/串接/规范化/去重/快照/事件/并发）
 tests/test_allergen_merge_revocation.py # 21 个并码撤销端到端测试（生效链/重并码/重算/事件/预演失效/旧库迁移）
+tests/test_label_approvals.py # 18 个标签签发审批端到端测试（申请/幂等/审批时效/签发绑定/封存/兼容）
 examples/demo.sh    # 全流程 curl 演示（含变更订阅）
 examples/demo_investigations.sh  # 调查封存专项 curl 演示
 examples/demo_merges.sh          # 过敏原代码并码专项 curl 演示
+examples/demo_label_approval.sh  # 标签签发审批专项 curl 演示
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

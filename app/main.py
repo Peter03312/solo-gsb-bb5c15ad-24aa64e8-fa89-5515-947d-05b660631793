@@ -16,6 +16,8 @@ from .schemas import (
     DeclarationCreate,
     DeclarationPreviewCreate,
     InvestigationCreate,
+    LabelApplicationCreate,
+    LabelApplicationReviewCreate,
     LabelCreate,
     MaterialCreate,
     ProcessingCreate,
@@ -31,9 +33,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.6.0",
+    version="1.7.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
-                "加工投入纠正、设备残留与清洗、来源路径查询、标签签发，"
+                "加工投入纠正、设备残留与清洗、来源路径查询、"
+                "标签签发审批（申请-批准-签发，冻结申请时结论，全程可审计），"
                 "声明更正/清洗撤销的预演与凭据提交、疑似交叉接触的调查封存、"
                 "过敏原代码并码（旧代码并入目标代码、可串接、可凭记录号撤销"
                 "单条关系、撤销后可重新并码、实时规范化），"
@@ -308,11 +311,65 @@ def get_change_events(cursor: int = 0,
 
 # ---------------------------------------------------------------- 标签
 
+@app.post("/label-applications", status_code=201, tags=["标签审批"])
+def create_label_application(data: LabelApplicationCreate,
+                             conn=Depends(get_conn)):
+    """提交标签签发申请（质控）：批次号、申请人、审批理由、拟签发标签备注、
+    当前溯源游标。
+
+    系统保存申请并冻结、返回申请时刻的实时结论（过敏原/待确认/来源路径）、
+    依据摘要与封存状态。游标须等于当前最大事件序号（过期结论 409、无效
+    游标 400、未知批次 400）；重复提交同一未决申请幂等返回原申请
+    （200，replayed=true）。
+    """
+    view, replayed = service.create_label_application(conn, data)
+    body = {**view, "replayed": replayed}
+    if replayed:  # 同一未决申请的重复提交：返回原申请，状态码 200
+        return JSONResponse(status_code=200, content=body)
+    return body
+
+
+@app.get("/label-applications", tags=["标签审批"])
+def list_label_applications(status: str | None = None,
+                            batch_id: str | None = None,
+                            conn=Depends(get_conn)):
+    """查询标签签发申请（可按 ?status=pending/approved/rejected、?batch_id=
+    过滤）；stale 标记实时结论/依据/封存是否已偏离申请时冻结。"""
+    return {"applications": service.list_label_applications(conn, status,
+                                                            batch_id)}
+
+
+@app.get("/label-applications/{application_id}", tags=["标签审批"])
+def get_label_application(application_id: int, conn=Depends(get_conn)):
+    """查询单条标签签发申请（含冻结结论/依据/封存与审批轨迹）。"""
+    return service.get_label_application(conn, application_id)
+
+
+@app.post("/label-applications/{application_id}/approve", tags=["标签审批"])
+def approve_label_application(application_id: int,
+                              data: LabelApplicationReviewCreate,
+                              conn=Depends(get_conn)):
+    """批准标签签发申请：仅当申请仍对应同一批次结论/依据/封存状态且批次
+    未封存；已处理申请不可重复审批（409）。"""
+    return service.review_label_application(conn, application_id,
+                                            "approved", data)
+
+
+@app.post("/label-applications/{application_id}/reject", tags=["标签审批"])
+def reject_label_application(application_id: int,
+                             data: LabelApplicationReviewCreate,
+                             conn=Depends(get_conn)):
+    """驳回标签签发申请：与批准同样的时效校验；驳回后禁止签发，需重新申请。"""
+    return service.review_label_application(conn, application_id,
+                                            "rejected", data)
+
+
 @app.post("/batches/{batch_id}/labels", status_code=201, tags=["标签"])
 def issue_label(batch_id: str, data: LabelCreate, conn=Depends(get_conn)):
-    """签发标签：冻结签发时刻的结论与依据，后续变更不影响本标签。
-    可通过 supersedes_id 关联被替代的旧版标签。"""
-    return service.issue_label(conn, batch_id, data.supersedes_id)
+    """签发标签：必须绑定已批准的签发申请（application_id），冻结申请时
+    结论与依据；一个批准只能签发一张标签。驳回或结论/封存变化禁止签发、
+    需重新申请。可通过 supersedes_id 关联被替代的旧版标签。"""
+    return service.issue_label(conn, batch_id, data)
 
 
 @app.get("/batches/{batch_id}/labels", tags=["标签"])

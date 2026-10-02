@@ -52,13 +52,42 @@ CREATE TABLE IF NOT EXISTS cleanings (
     revoked      INTEGER NOT NULL DEFAULT 0  -- 1 = 已撤销，撤销后不再清除残留
 );
 
--- 已签发标签：snapshot 为签发时刻冻结的结论与依据（JSON），不可更改
+-- 标签签发申请（可审计审批环节）：质控提交批次号、申请人、审批理由、
+-- 拟签发标签备注与当前溯源游标；系统冻结申请时刻的实时结论、依据与封存
+-- 状态。审核人仅在申请仍对应同一批次结论/依据/封存状态且未封存时批准或
+-- 驳回；批准后凭申请签发标签（一个批准只能签发一张标签，label_id 绑定），
+-- 驳回或结论/封存变化一律禁止签发、需重新申请。
+-- status: pending（未决）/ approved（已批准）/ rejected（已驳回）。
+CREATE TABLE IF NOT EXISTS label_applications (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id      TEXT NOT NULL,
+    applicant     TEXT NOT NULL,        -- 申请人
+    reason        TEXT NOT NULL,        -- 审批理由（必填）
+    note          TEXT,                 -- 拟签发标签备注（可空，签发时随标签冻结）
+    cursor        INTEGER NOT NULL,     -- 提交时的溯源游标（须等于当前最大事件序号）
+    status        TEXT NOT NULL DEFAULT 'pending',
+    snapshot      TEXT NOT NULL,        -- 申请时冻结的结论与依据（JSON）
+    release       TEXT NOT NULL,        -- 申请时冻结的封存状态（JSON）
+    created_at    TEXT NOT NULL,
+    reviewer      TEXT,                 -- 审核人
+    reviewed_at   TEXT,
+    review_note   TEXT,                 -- 审核意见（可空）
+    -- 签发后绑定（一个批准一张标签）；由签发事务与标签写入同步维护，
+    -- 有意不加外键：labels.application_id 已引用本表，避免循环依赖
+    label_id      INTEGER
+);
+
+-- 已签发标签：snapshot 为签发时刻冻结的结论与依据（JSON），不可更改。
+-- 审批流上线后签发的标签绑定批准记录（application_id）与申请备注（note）；
+-- 历史标签两列为 NULL，快照与查询结构保持兼容。
 CREATE TABLE IF NOT EXISTS labels (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id      TEXT NOT NULL,
     issued_at     TEXT NOT NULL,
     supersedes_id INTEGER REFERENCES labels(id),
-    snapshot      TEXT NOT NULL
+    snapshot      TEXT NOT NULL,
+    application_id INTEGER REFERENCES label_applications(id),
+    note          TEXT
 );
 
 -- 调查封存：QC 以“唯一调查号 + 疑似批次 + 原因”登记；受影响批次沿加工投入链
@@ -113,10 +142,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_allergen_merges_active_old
 """
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    """幂等迁移：旧版 allergen_code_merges（old_code 列级 UNIQUE、无撤销列）
-    重建为新表结构并搬移既有行（id 保持不变，事件 op_ref.merge_id 不失效）。
-    新结构库直接跳过。启动即执行，无需额外初始化步骤。"""
+def _migrate_merges(conn: sqlite3.Connection) -> None:
+    """幂等迁移（建表之前执行）：旧版 allergen_code_merges（old_code 列级
+    UNIQUE、无撤销列）重建为新表结构并搬移既有行（id 保持不变，事件
+    op_ref.merge_id 不失效）。新结构库直接跳过。"""
     cols = {r["name"] for r in conn.execute(
         "PRAGMA table_info(allergen_code_merges)")}
     if cols and "revoked" not in cols:
@@ -141,6 +170,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
             """)
 
 
+def _migrate_labels(conn: sqlite3.Connection) -> None:
+    """幂等迁移（建表之后执行，外键目标 label_applications 需已存在）：
+    旧版 labels（无 application_id / note 列）补加两列，历史标签两列为
+    NULL（审批流上线前签发，快照与查询保持兼容）。新结构库直接跳过。"""
+    label_cols = {r["name"] for r in conn.execute("PRAGMA table_info(labels)")}
+    if label_cols and "application_id" not in label_cols:
+        conn.execute(
+            "ALTER TABLE labels ADD COLUMN application_id"
+            " INTEGER REFERENCES label_applications(id)")
+        conn.execute("ALTER TABLE labels ADD COLUMN note TEXT")
+
+
 def db_path() -> str:
     return os.environ.get("DB_PATH", "app.db")
 
@@ -156,9 +197,12 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     conn = connect()
     try:
-        # 先迁移旧版表结构（新库为空操作），再幂等建表/建索引。
-        _migrate(conn)
+        # 1) 旧版并码表重建（SCHEMA 中的部分唯一索引依赖新结构的 revoked 列）；
+        # 2) 幂等建表/建索引（含新表 label_applications）；
+        # 3) 旧版 labels 补列（外键目标 label_applications 需已存在）。
+        _migrate_merges(conn)
         conn.executescript(SCHEMA)
+        _migrate_labels(conn)
     finally:
         conn.close()
 

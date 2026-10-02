@@ -15,6 +15,23 @@ req() { # METHOD PATH JSON
   echo
 }
 
+# 标签签发审批流：申请（当前溯源游标）-> 批准 -> 签发；返回标签响应
+issue_label() { # BATCH_ID [SUPERSEDES_ID]
+  local batch="$1" sup="${2:-}"
+  local cur aid
+  cur="$(curl -sS "$BASE/changes/snapshot" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')"
+  aid="$(curl -sS -X POST "$BASE/label-applications" -H 'Content-Type: application/json' \
+    -d "{\"batch_id\":\"$batch\",\"applicant\":\"qc-demo\",\"reason\":\"例行放行审核\",\"cursor\":$cur}" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["application_id"])')"
+  curl -sS -X POST "$BASE/label-applications/$aid/approve" -H 'Content-Type: application/json' \
+    -d '{"reviewer":"qa-demo"}' > /dev/null
+  if [ -n "$sup" ]; then
+    req POST "/batches/$batch/labels" "{\"application_id\":$aid,\"supersedes_id\":$sup}"
+  else
+    req POST "/batches/$batch/labels" "{\"application_id\":$aid}"
+  fi
+}
+
 step "1. 登记原料批次（含过敏原 / 待确认）"
 req POST /materials '{"batch_id":"RM-MILK","allergens":["milk"],"declared_at":"2026-01-02T06:00:00Z"}'
 req POST /materials '{"batch_id":"RM-OAT","allergens":["gluten"],"declared_at":"2026-01-02T06:00:00Z"}'
@@ -41,10 +58,10 @@ step "6. 原料声明更正：RM-OAT 实际含 sesame"
 req POST /materials/RM-OAT/declarations '{"allergens":["gluten","sesame"]}'
 req GET /batches/OUT-OAT-1/trace
 
-step "7. 签发标签（冻结当前结论）；再更正声明后签发关联旧版的新标签"
-req POST /batches/OUT-OAT-1/labels '{}'
+step "7. 签发标签（审批流：申请 -> 批准 -> 签发，冻结申请时结论）；再更正声明后签发关联旧版的新标签"
+issue_label OUT-OAT-1
 req POST /materials/RM-OAT/declarations '{"allergens":["gluten","sesame","soy"]}'
-req POST /batches/OUT-OAT-1/labels '{"supersedes_id":1}'
+issue_label OUT-OAT-1 1
 step "旧标签保持不变"
 req GET /labels/1
 step "新标签反映最新结论"

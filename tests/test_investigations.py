@@ -23,7 +23,8 @@ def client():
     conn = db.connect()
     for t in ["material_declarations", "material_batches", "processing_inputs",
               "processing_outputs", "processings", "cleanings", "labels",
-              "trace_events", "investigations", "allergen_code_merges"]:
+              "trace_events", "investigations", "label_applications",
+              "allergen_code_merges"]:
         conn.execute(f"DELETE FROM {t}")
     conn.execute("DELETE FROM sqlite_sequence WHERE name = 'trace_events'")
     conn.close()
@@ -52,6 +53,19 @@ def investigate(c, iid, batch_id, reason="疑似交叉接触"):
 
 def lift(c, iid):
     return c.post(f"/investigations/{iid}/lift")
+
+
+def issue_label(c, batch_id):
+    """走完审批流签发标签：申请（当前游标）-> 批准 -> 签发。"""
+    cursor = c.get("/changes/snapshot").json()["cursor"]
+    app = c.post("/label-applications", json={
+        "batch_id": batch_id, "applicant": "qc-1",
+        "reason": "例行放行审核", "cursor": cursor})
+    assert app.status_code == 201, app.text
+    aid = app.json()["application_id"]
+    r = c.post(f"/label-applications/{aid}/approve", json={"reviewer": "qa-1"})
+    assert r.status_code == 200, r.text
+    return c.post(f"/batches/{batch_id}/labels", json={"application_id": aid})
 
 
 def events(c, cursor=0, **params):
@@ -305,10 +319,19 @@ def test_open_events_sorted_and_query_listing(client):
 def test_held_batch_blocks_label(client):
     build_topology(client)
     # 封存前签发的标签保留
-    label = client.post("/batches/A2/labels", json={})
+    label = issue_label(client, "A2")
     assert label.status_code == 201
     investigate(client, "INV-1", "RM-H")
-    r = client.post("/batches/A2/labels", json={})
+    # 封存批次：申请可登记（返回封存状态），但审批被拒绝
+    cursor = client.get("/changes/snapshot").json()["cursor"]
+    app = client.post("/label-applications", json={
+        "batch_id": "A2", "applicant": "qc-1",
+        "reason": "例行放行审核", "cursor": cursor})
+    assert app.status_code == 201
+    assert app.json()["release"]["held"] is True
+    r = client.post(
+        f"/label-applications/{app.json()['application_id']}/approve",
+        json={"reviewer": "qa-1"})
     assert r.status_code == 409 and "封存" in r.json()["detail"]
     # 失败不留标签
     labels = client.get("/batches/A2/labels").json()
@@ -316,9 +339,9 @@ def test_held_batch_blocks_label(client):
     # 旧标签快照不变
     frozen = client.get(f"/labels/{label.json()['label_id']}").json()
     assert "release" not in frozen["conclusion"]
-    # 解除后可签发
+    # 解除后可签发（封存状态变化使原申请失效，需重新申请）
     lift(client, "INV-1")
-    assert client.post("/batches/A2/labels", json={}).status_code == 201
+    assert issue_label(client, "A2").status_code == 201
 
 
 def test_held_input_blocks_new_processing(client):
@@ -448,10 +471,15 @@ def test_failed_operations_leave_no_hold_events(client):
     investigate(client, "INV-1", "RM-H")
     assert lift(client, "INV-1").status_code == 200
     assert lift(client, "INV-1").status_code == 409   # 重复解除
-    # 解除后标签可签发；重新封存后被拒绝
-    assert client.post("/batches/A2/labels", json={}).status_code == 201
+    # 解除后标签可签发；重新封存后审批被拒绝
+    assert issue_label(client, "A2").status_code == 201
     investigate(client, "INV-2", "RM-H")
-    assert client.post("/batches/A2/labels", json={}).status_code == 409
+    snap_cursor = client.get("/changes/snapshot").json()["cursor"]
+    aid = client.post("/label-applications", json={
+        "batch_id": "A2", "applicant": "qc-1",
+        "reason": "例行放行审核", "cursor": snap_cursor}).json()["application_id"]
+    assert client.post(f"/label-applications/{aid}/approve",
+                       json={"reviewer": "qa-1"}).status_code == 409
     assert processing(client, "P9", "EQ-A", "2026-01-02T16:00:00Z",
                       "2026-01-02T17:00:00Z", ["A3"], ["Z1"]).status_code == 409
     page = events(client, cur)

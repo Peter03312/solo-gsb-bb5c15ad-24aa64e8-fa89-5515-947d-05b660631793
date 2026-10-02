@@ -35,7 +35,10 @@ step "3. 实时溯源同步附 release（过敏原仍为空，但封存独立成
 req GET /batches/OUT-2/trace | q
 
 step "4. 封存批次不得签发标签 / 不得作为新加工投入（均 409，失败不留痕）"
-req POST /batches/OUT-2/labels '{}'
+step "4a. 封存批次可提交签发申请（响应如实返回封存状态），但审批被拒绝 409"
+CUR="$(curl -sS "$BASE/changes/snapshot" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')"
+AID="$(req POST /label-applications "{\"batch_id\":\"OUT-2\",\"applicant\":\"qc-demo\",\"reason\":\"例行放行审核\",\"cursor\":$CUR}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["application_id"])')"
+req POST "/label-applications/$AID/approve" '{"reviewer":"qa-demo"}'
 req POST /processings '{"processing_id":"P9","equipment_id":"EQ-2","start_utc":"2026-01-02T12:00:00Z","end_utc":"2026-01-02T13:00:00Z","inputs":["OUT-2"],"outputs":["OUT-9"]}'
 
 step "4b. 设备残留会封存新产出时同样拒绝登记（EQ-1 上 P2 之后、无清洗）"
@@ -66,8 +69,11 @@ step "INV-002 解除后 OUT-2 仍被 INV-003 封存；重复解除 INV-002 报 4
 req GET /batches/OUT-2/release | q
 req POST /investigations/INV-002/lift
 req POST /investigations/INV-003/lift
-step "全部解除后可签发标签（旧约束消失）"
-req POST /batches/OUT-2/labels '{}'
+step "全部解除后可签发标签（旧约束消失；封存状态已变化，需重新申请 -> 批准 -> 签发）"
+CUR="$(curl -sS "$BASE/changes/snapshot" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')"
+AID="$(req POST /label-applications "{\"batch_id\":\"OUT-2\",\"applicant\":\"qc-demo\",\"reason\":\"解除封存后放行\",\"cursor\":$CUR}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["application_id"])')"
+req POST "/label-applications/$AID/approve" '{"reviewer":"qa-demo"}' > /dev/null
+req POST /batches/OUT-2/labels "{\"application_id\":$AID}"
 
 step "9. 变更事件流：封存/解除按批次号顺序发布实际变化（release 字段附加，分页约定不变）"
 req GET "/changes/events?cursor=0&limit=50" | python3 -c 'import sys,json

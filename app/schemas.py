@@ -77,7 +77,59 @@ class CleaningCreate(BaseModel):
 
 
 class LabelCreate(BaseModel):
+    """签发标签：必须绑定已批准的签发申请（批准后才能签发）。"""
+
+    application_id: int                 # 必填：已批准的标签签发申请号
     supersedes_id: Optional[int] = None  # 关联被替代的旧标签
+
+
+class LabelApplicationCreate(BaseModel):
+    """标签签发申请：批次号、申请人、审批理由、拟签发标签备注、当前溯源游标。"""
+
+    batch_id: str = Field(min_length=1)
+    applicant: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    note: Optional[str] = None          # 拟签发标签备注（可空）
+    cursor: int                         # 提交时的溯源游标（/changes/snapshot）
+
+    @field_validator("batch_id", "applicant", "reason")
+    @classmethod
+    def _v_nonblank(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+    @field_validator("note")
+    @classmethod
+    def _v_note(cls, v):
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None                 # 空白备注归一化为缺省
+
+
+class LabelApplicationReviewCreate(BaseModel):
+    """标签签发申请审批：审核人 + 可选审核意见。"""
+
+    reviewer: str = Field(min_length=1)
+    note: Optional[str] = None
+
+    @field_validator("reviewer")
+    @classmethod
+    def _v_nonblank(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+    @field_validator("note")
+    @classmethod
+    def _v_note(cls, v):
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
 
 class InvestigationCreate(BaseModel):

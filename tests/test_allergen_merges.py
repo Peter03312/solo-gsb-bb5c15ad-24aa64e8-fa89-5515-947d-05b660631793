@@ -27,7 +27,8 @@ def client():
     conn = db.connect()
     for t in ["material_declarations", "material_batches", "processing_inputs",
               "processing_outputs", "processings", "cleanings", "labels",
-              "trace_events", "investigations", "allergen_code_merges"]:
+              "trace_events", "investigations", "label_applications",
+              "allergen_code_merges"]:
         conn.execute(f"DELETE FROM {t}")
     conn.execute("DELETE FROM sqlite_sequence WHERE name = 'trace_events'")
     conn.execute("DELETE FROM sqlite_sequence WHERE name = 'allergen_code_merges'")
@@ -48,6 +49,19 @@ def processing(c, pid, eq, start, end, inputs, outputs):
         "processing_id": pid, "equipment_id": eq,
         "start_utc": start, "end_utc": end,
         "inputs": inputs, "outputs": outputs})
+
+def issue_label(c, batch_id):
+    """走完审批流签发标签：申请（当前游标）-> 批准 -> 签发。"""
+    cursor = c.get("/changes/snapshot").json()["cursor"]
+    app = c.post("/label-applications", json={
+        "batch_id": batch_id, "applicant": "qc-1",
+        "reason": "例行放行审核", "cursor": cursor})
+    assert app.status_code == 201, app.text
+    aid = app.json()["application_id"]
+    r = c.post(f"/label-applications/{aid}/approve", json={"reviewer": "qa-1"})
+    assert r.status_code == 200, r.text
+    return c.post(f"/batches/{batch_id}/labels", json={"application_id": aid})
+
 
 
 def merge(c, old, target, reason="同义词并码"):
@@ -231,7 +245,7 @@ def test_declaration_versions_and_issued_labels_keep_raw_values(client):
     processing(client, "P1", "EQ-1",
                "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
                ["RM-1"], ["OUT-1"])
-    issued = client.post("/batches/OUT-1/labels", json={}).json()
+    issued = issue_label(client, "OUT-1").json()
     assert issued["conclusion"]["allergens"] == ["casein"]  # 签发时快照
     merge(client, "casein", "milk")
     label = client.get(f"/labels/{issued['label_id']}").json()
@@ -245,7 +259,7 @@ def test_declaration_versions_and_issued_labels_keep_raw_values(client):
     live = client.get("/batches/OUT-1/trace").json()
     assert live["allergens"] == ["milk"]
     # 并码后新签发标签按当前规范代码冻结
-    label2 = client.post("/batches/OUT-1/labels", json={}).json()
+    label2 = issue_label(client, "OUT-1").json()
     assert label2["conclusion"]["allergens"] == ["milk"]
 
 

@@ -26,8 +26,11 @@ req POST /materials '{"batch_id":"RM-B","allergens":["dairy"],"declared_at":"202
 req POST /materials '{"batch_id":"RM-C","allergens":["milk"],"declared_at":"2026-01-02T06:00:00Z"}'
 req POST /processings '{"processing_id":"P1","equipment_id":"EQ-9","start_utc":"2026-01-02T08:00:00Z","end_utc":"2026-01-02T09:00:00Z","inputs":["RM-A","RM-B","RM-C"],"outputs":["OUT-9"]}'
 
-step "2. 并码前签发标签（冻结当时结论：三个代码各自独立）"
-req POST /batches/OUT-9/labels '{}'
+step "2. 并码前签发标签（审批流：申请 -> 批准 -> 签发；冻结当时结论：三个代码各自独立）"
+CUR="$(curl -sS "$BASE/changes/snapshot" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')"
+AID="$(req POST /label-applications "{\"batch_id\":\"OUT-9\",\"applicant\":\"qc-demo\",\"reason\":\"例行放行审核\",\"cursor\":$CUR}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["application_id"])')"
+req POST "/label-applications/$AID/approve" '{"reviewer":"qa-demo"}' > /dev/null
+req POST /batches/OUT-9/labels "{\"application_id\":$AID}"
 
 step "3. 登记并码（必填原因）：casein -> dairy，再串接 dairy -> milk"
 req POST /allergen-merges '{"old_code":"casein","target_code":"dairy","reason":"供应商代码勘误：酪蛋白归入乳制品类"}'
