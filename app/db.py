@@ -52,13 +52,43 @@ CREATE TABLE IF NOT EXISTS cleanings (
     revoked      INTEGER NOT NULL DEFAULT 0  -- 1 = 已撤销，撤销后不再清除残留
 );
 
--- 已签发标签：snapshot 为签发时刻冻结的结论与依据（JSON），不可更改
+-- 已签发标签：snapshot 为签发时刻冻结的结论与依据（JSON），不可更改。
+-- approval_id 非空时表示该标签经由“签发申请->审核批准”流程签发，绑定批准记录；
+-- 旧库迁移后既有标签该列为 NULL（直接签发的历史标签，保持兼容）。
 CREATE TABLE IF NOT EXISTS labels (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id      TEXT NOT NULL,
     issued_at     TEXT NOT NULL,
     supersedes_id INTEGER REFERENCES labels(id),
+    approval_id   INTEGER,
     snapshot      TEXT NOT NULL
+);
+
+-- 标签签发审批（可审计）：质控以“批次号 + 申请人 + 审批理由 + 拟签发标签备注
+-- + 当前溯源游标”提交签发申请；系统保存申请并冻结申请时结论（过敏原/待确认/
+-- 依据/封存状态）。审核人只能在申请仍为 pending 且批次结论与冻结一致、未封存
+-- 时批准/驳回；批准后签发必须绑定本记录，并以冻结结论为标签快照。结论或封存
+-- 状态自申请后变化则批准与签发均拒绝，需重新申请。同一 (批次, 申请人) 至多
+-- 一条未决申请：完全相同的重复提交幂等返回原申请，不同内容的重复提交 409。
+-- status: pending（待审）/ approved（已批准待签发）/ rejected（已驳回）/
+--         issued（已凭批准记录签发；issued_label_id 指向标签）。
+CREATE TABLE IF NOT EXISTS label_applications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        TEXT NOT NULL,
+    applicant       TEXT NOT NULL,          -- 申请人（质控）
+    reason          TEXT NOT NULL,          -- 审批理由（必填）
+    label_note      TEXT NOT NULL DEFAULT '',  -- 拟签发标签备注（可空）
+    requested_cursor INTEGER NOT NULL,      -- 提交时客户端声称的溯源游标
+    cursor_seq      INTEGER NOT NULL,       -- 服务端受理时的事件游标（上界）
+    frozen_view     TEXT NOT NULL,          -- 申请时冻结的完整视图（结论+依据+封存）
+    status          TEXT NOT NULL DEFAULT 'pending',
+    created_at      TEXT NOT NULL,
+    reviewer        TEXT,                   -- 审核人（批准/驳回时落定）
+    reviewed_at     TEXT,
+    review_note     TEXT,                   -- 审核备注（可选）
+    reject_reason   TEXT,                   -- 驳回原因（驳回时必填）
+    issued_at       TEXT,
+    issued_label_id INTEGER
 );
 
 -- 调查封存：QC 以“唯一调查号 + 疑似批次 + 原因”登记；受影响批次沿加工投入链
@@ -110,12 +140,24 @@ CREATE INDEX IF NOT EXISTS idx_trace_events_batch ON trace_events(batch_id);
 -- 每个旧代码至多一条生效中的并码（撤销行保留但不占名额，撤销后可重新并码）。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_allergen_merges_active_old
     ON allergen_code_merges(old_code) WHERE revoked = 0;
+
+-- 同一（批次, 申请人）至多一条未决（pending）签发申请：重复提交相同申请
+-- 幂等返回原申请；不同内容重复提交冲突。已处理（批准/驳回/已签发）申请不
+-- 占名额，可重新申请。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_label_applications_open
+    ON label_applications(batch_id, applicant) WHERE status = 'pending';
+
+-- 每条批准记录至多绑定一张已签发标签（重复签发在库层即被拒绝）。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_label_applications_issued_label
+    ON label_applications(issued_label_id) WHERE issued_label_id IS NOT NULL;
 """
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """幂等迁移：旧版 allergen_code_merges（old_code 列级 UNIQUE、无撤销列）
-    重建为新表结构并搬移既有行（id 保持不变，事件 op_ref.merge_id 不失效）。
+    """幂等迁移：
+    1) 旧版 allergen_code_merges（old_code 列级 UNIQUE、无撤销列）
+       重建为新表结构并搬移既有行（id 保持不变，事件 op_ref.merge_id 不失效）。
+    2) 旧版 labels 缺少 approval_id 列时补列（历史标签视为直接签发，值 NULL）。
     新结构库直接跳过。启动即执行，无需额外初始化步骤。"""
     cols = {r["name"] for r in conn.execute(
         "PRAGMA table_info(allergen_code_merges)")}
@@ -139,6 +181,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 FROM allergen_code_merges_old;
             DROP TABLE allergen_code_merges_old;
             """)
+    label_cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(labels)")}
+    if label_cols and "approval_id" not in label_cols:
+        conn.execute("ALTER TABLE labels ADD COLUMN approval_id INTEGER")
 
 
 def db_path() -> str:

@@ -1,8 +1,8 @@
 """请求/响应模型。时间一律要求带时区（AwareDatetime），入库前归一化为 UTC。"""
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import AwareDatetime, BaseModel, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, Field, field_validator, model_validator
 
 
 def _clean_allergens(values: list[str]) -> list[str]:
@@ -77,7 +77,73 @@ class CleaningCreate(BaseModel):
 
 
 class LabelCreate(BaseModel):
+    # 走“签发申请 -> 审核批准”流程时必填：已批准且结论未变化的签发申请号。
+    # 缺省（None）为历史兼容的直接签发路径（封存批次仍拒绝）。
+    approval_id: Optional[int] = None
     supersedes_id: Optional[int] = None  # 关联被替代的旧标签
+
+
+class LabelApplicationCreate(BaseModel):
+    """标签签发申请（质控提交，进入可审计审批环节）。"""
+
+    batch_id: str = Field(min_length=1)
+    applicant: str = Field(min_length=1)   # 申请人
+    reason: str = Field(min_length=1)      # 审批理由（必填）
+    label_note: Optional[str] = None       # 拟签发标签备注（可空）
+    # 提交时客户端已同步到的溯源事件游标（GET /changes/events 的 next_cursor）。
+    # 越界（负数/超过当前最大序号）返回 400，要求先同步后再申请。
+    cursor: int = Field(ge=0)
+
+    @field_validator("batch_id", "applicant", "reason")
+    @classmethod
+    def _v_nonblank(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+    @field_validator("label_note")
+    @classmethod
+    def _v_note(cls, v):
+        if v is None:
+            return ""
+        return v.strip()
+
+
+class LabelApplicationDecision(BaseModel):
+    """审核决定：批准（approve）或驳回（reject）。
+
+    reviewer 必填；reject 时 reject_reason 必填（空白 422）；note 为可选审核备注。
+    """
+
+    decision: Literal["approve", "reject"]
+    reviewer: str = Field(min_length=1)
+    reject_reason: Optional[str] = None
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _v_reject_reason(self):
+        if self.decision == "reject":
+            reason = (self.reject_reason or "").strip()
+            if not reason:
+                raise ValueError("驳回必须填写驳回原因（reject_reason）")
+            self.reject_reason = reason
+        return self
+
+    @field_validator("reviewer")
+    @classmethod
+    def _v_reviewer(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+    @field_validator("reject_reason", "note")
+    @classmethod
+    def _v_optional_strip(cls, v):
+        if v is None:
+            return None
+        return v.strip() or None
 
 
 class InvestigationCreate(BaseModel):

@@ -1197,13 +1197,27 @@ def list_change_events(conn: sqlite3.Connection, cursor: int, limit: int,
 
 # ---------------------------------------------------------------- 标签签发
 
-def issue_label(conn: sqlite3.Connection, batch_id: str, supersedes_id: int | None) -> dict:
+def issue_label(conn: sqlite3.Connection, batch_id: str,
+                supersedes_id: int | None = None,
+                approval_id: int | None = None) -> dict:
+    """签发标签。
+
+    - 审批流程（approval_id 非空）：申请必须存在且属于该批次、状态为 approved
+      （已由审核人批准）、尚未用于签发；签发前在同一事务复核申请冻结结论与
+      当前实时结论（过敏原/待确认/依据/封存）仍逐字节一致且未封存——一致则
+      标签快照**冻结申请时结论**并绑定批准记录（labels.approval_id），
+      申请置为 issued；结论/封存变化、驳回、未批准或已签发一律 409 拒绝，
+      需重新申请。
+    - 兼容路径（approval_id 为空）：沿用历史行为，冻结签发时刻实时结论；
+      封存批次仍拒绝（409）。
+    旧标签快照结构（conclusion/basis）与查询响应保持兼容。
+    """
     with write_tx(conn):
         kind, _ = batch_kind(conn, batch_id)
         if not kind:
             raise NotFound(f"未知批次: {batch_id}")
-        # 封存批次不得签发新标签（旧标签快照不受影响、永不变更）
-        release = _all_releases(conn).get(batch_id, _empty_release())
+        releases = _all_releases(conn)
+        release = releases.get(batch_id, _empty_release())
         if release["held"]:
             held_by = sorted(e["investigation_id"]
                              for e in release["investigations"])
@@ -1218,19 +1232,59 @@ def issue_label(conn: sqlite3.Connection, batch_id: str, supersedes_id: int | No
                 raise BadRequest(
                     f"旧标签 {supersedes_id} 属于批次 {old['batch_id']}，"
                     f"不能关联到批次 {batch_id} 的新标签")
-        # 签发时刻冻结结论与依据
-        view = trace_view(conn, batch_id)
+
+        app_row = None
+        if approval_id is not None:
+            app_row = conn.execute(
+                "SELECT * FROM label_applications WHERE id = ?",
+                (approval_id,)).fetchone()
+            if not app_row:
+                raise NotFound(f"未知标签签发申请: {approval_id}")
+            if app_row["batch_id"] != batch_id:
+                raise BadRequest(
+                    f"签发申请 {approval_id} 属于批次 {app_row['batch_id']}，"
+                    f"不能用于批次 {batch_id} 的标签签发")
+            if app_row["status"] == "issued":
+                raise Conflict(
+                    f"签发申请 {approval_id} 已用于标签 "
+                    f"{app_row['issued_label_id']}，批准记录不可重复签发")
+            if app_row["status"] != "approved":
+                raise Conflict(
+                    f"签发申请 {approval_id} 当前状态为 {app_row['status']}，"
+                    "未批准或已驳回，不能签发标签；请重新提交申请并经审核批准")
+            frozen = json.loads(app_row["frozen_view"])
+            live = trace_view(conn, batch_id, releases=releases)
+            if _view_key(live) != _view_key(frozen):
+                raise Conflict(
+                    f"签发申请 {approval_id} 冻结的批次结论自批准后已变化"
+                    "（过敏原/待确认/依据/封存状态不一致），禁止签发，"
+                    "请以当前结论重新提交签发申请")
+            # 批准时已校验未封存，这里以明确错误再兜底（结论比对同样会拦截）。
+            conclusion = frozen["conclusion"]
+            basis = frozen["basis"]
+        else:
+            view = trace_view(conn, batch_id, releases=releases)
+            conclusion = view["conclusion"]
+            basis = view["basis"]
+
         snapshot = {
             "batch_id": batch_id,
-            "conclusion": view["conclusion"],
-            "basis": view["basis"],
+            "conclusion": conclusion,
+            "basis": basis,
         }
         cur = conn.execute(
-            "INSERT INTO labels (batch_id, issued_at, supersedes_id, snapshot)"
-            " VALUES (?, ?, ?, ?)",
-            (batch_id, to_store(now_utc()), supersedes_id, json.dumps(snapshot)),
+            "INSERT INTO labels (batch_id, issued_at, supersedes_id, approval_id, snapshot)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (batch_id, to_store(now_utc()), supersedes_id, approval_id,
+             json.dumps(snapshot)),
         )
         label_id = cur.lastrowid
+        if app_row is not None:
+            conn.execute(
+                "UPDATE label_applications"
+                " SET status = 'issued', issued_at = ?, issued_label_id = ?"
+                " WHERE id = ? AND status = 'approved'",
+                (to_store(now_utc()), label_id, approval_id))
     return get_label(conn, label_id)
 
 
@@ -1244,6 +1298,8 @@ def get_label(conn: sqlite3.Connection, label_id: int) -> dict:
         "batch_id": row["batch_id"],
         "issued_at": iso_z(row["issued_at"]),
         "supersedes_id": row["supersedes_id"],
+        # 经审批流程签发时为批准的签发申请号；历史直接签发标签为 None。
+        "approval_id": row["approval_id"],
         "conclusion": snap["conclusion"],
         "basis": snap["basis"],
     }
@@ -1990,3 +2046,246 @@ def batch_release(conn: sqlite3.Connection, batch_id: str) -> dict:
              "paths": e["paths"]}
             for e in rel["investigations"]],
     }
+
+
+# ---------------------------------------------------------------- 标签签发审批
+#
+# 标签签发纳入可审计审批环节：质控提交“批次号 + 申请人 + 审批理由 + 拟签发
+# 标签备注 + 当前溯源游标”的签发申请，系统在受理事务内冻结申请时的完整结论
+# （过敏原/待确认/来源路径）、依据（声明版本、清洗）与封存状态并返回。审核人
+# 只能在申请仍为 pending、且批次当前结论与冻结一致（同一批次结论）且未封存时
+# 批准或驳回：批准后方可凭申请号签发，签发时绑定批准记录并使用申请时冻结的
+# 结论作为标签快照；驳回后、结论/封存变化后均禁止签发并要求重新申请。同一
+# 未决申请的重复提交幂等返回原申请；已处理申请不可重复审批。
+#
+# 状态机：pending --approve--> approved --issue(冻结结论仍一致)--> issued
+#         pending/approved --reject--> rejected（终态，可重新提交新申请）
+#         pending/approved 期间结论或封存状态变化 -> approve/issue 拒绝；
+#         审核人可驳回已批准但已过期的申请（reject）以放行重新申请，
+#         申请记录保留可审计。
+
+_LABEL_APP_TERMINAL = {"rejected", "issued"}
+
+
+def _basis_summary(view: dict) -> dict:
+    """依据摘要：供审核人快速判读的结构化摘要（完整依据仍在 basis 中）。"""
+    decls = view["basis"]["material_declarations"]
+    return {
+        "allergens": sorted(view["conclusion"]["allergens"]),
+        "pending": bool(view["conclusion"]["pending"]),
+        "held": bool(view["release"].get("held")),
+        "active_investigations": sorted(
+            e["investigation_id"] for e in view["release"].get("investigations", [])),
+        "material_versions": [
+            {"batch_id": d["batch_id"], "version": d["version"],
+             "allergens": sorted(d["allergens"]),
+             "pending": bool(d["pending"])}
+            for d in sorted(decls, key=lambda d: d["batch_id"])],
+        "cleaning_basis": [
+            {"id": c["id"], "equipment_id": c["equipment_id"],
+             "cleaned_at": c["cleaned_at"]}
+            for c in sorted(view["basis"]["cleanings"], key=lambda c: c["id"])],
+    }
+
+
+def _label_application_view(conn: sqlite3.Connection, row,
+                            include_live: bool = True) -> dict:
+    """签发申请的对外视图。冻结视图始终返回（申请时实时结论）；
+    include_live 时附带当前实时视图与一致性判定，供提交响应/审核判读。"""
+    frozen = json.loads(row["frozen_view"])
+    out = {
+        "application_id": row["id"],
+        "batch_id": row["batch_id"],
+        "applicant": row["applicant"],
+        "reason": row["reason"],
+        "label_note": row["label_note"],
+        "status": row["status"],
+        "requested_cursor": row["requested_cursor"],
+        "cursor_seq": row["cursor_seq"],
+        "created_at": iso_z(row["created_at"]),
+        "reviewer": row["reviewer"],
+        "reviewed_at": iso_z(row["reviewed_at"]) if row["reviewed_at"] else None,
+        "review_note": row["review_note"],
+        "reject_reason": row["reject_reason"],
+        "issued_at": iso_z(row["issued_at"]) if row["issued_at"] else None,
+        "issued_label_id": row["issued_label_id"],
+        # 申请时冻结的实时过敏原、待确认、封存状态及完整视图
+        "allergens": sorted(frozen["conclusion"]["allergens"]),
+        "pending": bool(frozen["conclusion"]["pending"]),
+        "held_at_request": bool(frozen["release"].get("held")),
+        "frozen_conclusion": frozen["conclusion"],
+        "basis": frozen["basis"],
+        "basis_summary": _basis_summary(frozen),
+    }
+    if include_live:
+        kind, _ = batch_kind(conn, row["batch_id"])
+        if kind:
+            live_releases = _all_releases(conn)
+            live = trace_view(conn, row["batch_id"], releases=live_releases)
+            latest = _max_event_seq(conn)
+            out["current"] = {
+                "allergens": sorted(live["conclusion"]["allergens"]),
+                "pending": bool(live["conclusion"]["pending"]),
+                "held": bool(live["release"].get("held")),
+                "release": live["release"],
+                "latest_cursor": latest,
+            }
+            out["conclusion_stale"] = _view_key(live) != _view_key(frozen)
+            out["cursor_behind"] = row["requested_cursor"] < latest
+        else:
+            # 批次被异常删除等情况（当前数据模型不会发生）：防御性标记。
+            out["current"] = None
+            out["conclusion_stale"] = True
+            out["cursor_behind"] = True
+    return out
+
+
+def create_label_application(conn: sqlite3.Connection, data) -> tuple[dict, bool]:
+    """提交标签签发申请。返回 (application_view, replayed)。
+
+    - 未知批次 400；审批理由空白由请求层 422。
+    - cursor 越界（负数由请求层 422；超过当前最大事件序号）400（过期/无效游标，
+      需先按 /changes 同步后再申请）。
+    - 同一 (批次, 申请人) 已有未决申请：内容（理由/备注）完全相同 -> 幂等返回
+      原申请（200, replayed=true，不重复写）；内容不同 -> 409，需先等审核或
+      使用原申请。
+    - 封存状态不阻止申请（申请时如实返回封存状态），但封存期间不能批准/签发。
+    """
+    with write_tx(conn):
+        kind, _ = batch_kind(conn, data.batch_id)
+        if not kind:
+            raise BadRequest(f"未知批次: {data.batch_id}")
+        max_seq = _max_event_seq(conn)
+        if data.cursor > max_seq:
+            raise BadRequest(
+                f"无效/过期溯源游标: {data.cursor}（当前有效范围 0..{max_seq}），"
+                "请先同步变更事件后再提交签发申请")
+
+        existing = conn.execute(
+            "SELECT * FROM label_applications"
+            " WHERE batch_id = ? AND applicant = ? AND status = 'pending'",
+            (data.batch_id, data.applicant)).fetchone()
+        if existing:
+            if (existing["reason"] == data.reason
+                    and existing["label_note"] == data.label_note):
+                # 重复提交同一未决申请：幂等返回原申请，不重复写。
+                return _label_application_view(conn, existing), True
+            raise Conflict(
+                f"批次 {data.batch_id} 已有申请人 {data.applicant} 的未决签发申请"
+                f"（#{existing['id']}）：该申请批准或驳回前不能以不同内容重复提交")
+
+        view = trace_view(conn, data.batch_id, releases=_all_releases(conn))
+        created_at = to_store(now_utc())
+        cur = conn.execute(
+            "INSERT INTO label_applications"
+            " (batch_id, applicant, reason, label_note, requested_cursor,"
+            "  cursor_seq, frozen_view, status, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (data.batch_id, data.applicant, data.reason,
+             data.label_note or "", data.cursor, max_seq,
+             json.dumps(view, ensure_ascii=False, sort_keys=True), created_at))
+        row = conn.execute(
+            "SELECT * FROM label_applications WHERE id = ?",
+            (cur.lastrowid,)).fetchone()
+    return _label_application_view(conn, row), False
+
+
+def decide_label_application(conn: sqlite3.Connection, application_id: int,
+                             data) -> dict:
+    """审核签发申请：批准或驳回（审核人必填；驳回必填驳回原因）。
+
+    - pending：可批准或驳回。批准要求批次当前结论与申请冻结结论完全一致
+      （同一批次结论：过敏原/待确认/依据/封存），且批次当前未封存；结论已变化
+      或批次被封存 -> 409 拒绝批准，需重新申请。
+    - approved（已批准、尚未签发）：若结论/封存自批准后变化，审核人可**撤销
+      批准并驳回**（reject，必填驳回原因）——驳回不校验结论新鲜度，使申请人
+      能以当前结论重新申请。
+    - rejected / issued 为终态：已处理申请不可重复审批（409）。
+    """
+    with write_tx(conn):
+        row = conn.execute(
+            "SELECT * FROM label_applications WHERE id = ?",
+            (application_id,)).fetchone()
+        if not row:
+            raise NotFound(f"未知标签签发申请: {application_id}")
+        if row["status"] in ("rejected", "issued"):
+            raise Conflict(
+                f"签发申请 {application_id} 已处理（状态 {row['status']}），"
+                "不能重复审批")
+        reviewed_at = to_store(now_utc())
+        if data.decision == "reject":
+            if not data.reject_reason:
+                # 模型层已校验；服务层兜底，保持 422 由请求层保证。
+                raise BadRequest("驳回必须填写驳回原因")
+            conn.execute(
+                "UPDATE label_applications"
+                " SET status = 'rejected', reviewer = ?, reviewed_at = ?,"
+                "     review_note = ?, reject_reason = ?"
+                " WHERE id = ? AND status IN ('pending','approved')",
+                (data.reviewer, reviewed_at, data.note,
+                 data.reject_reason, application_id))
+        else:
+            if row["status"] != "pending":
+                raise Conflict(
+                    f"签发申请 {application_id} 已批准（状态 approved），"
+                    "不能重复批准；如需撤销批准请驳回（reject）后要求申请人重新申请")
+            kind, _ = batch_kind(conn, row["batch_id"])
+            if not kind:
+                raise BadRequest(f"未知批次: {row['batch_id']}")
+            releases = _all_releases(conn)
+            release = releases.get(row["batch_id"], _empty_release())
+            if release["held"]:
+                held_by = sorted(e["investigation_id"]
+                                 for e in release["investigations"])
+                raise Conflict(
+                    f"批次 {row['batch_id']} 已被调查封存（{held_by}），"
+                    f"不能批准签发申请 {application_id}；解除封存后请重新申请")
+            frozen = json.loads(row["frozen_view"])
+            live = trace_view(conn, row["batch_id"], releases=releases)
+            if _view_key(live) != _view_key(frozen):
+                raise Conflict(
+                    f"批次 {row['batch_id']} 的结论自申请 {application_id} 提交后"
+                    "已变化（过敏原/待确认/依据与申请时不一致），不能按过期结论"
+                    "批准；请要求申请人以当前结论重新提交")
+            conn.execute(
+                "UPDATE label_applications"
+                " SET status = 'approved', reviewer = ?, reviewed_at = ?,"
+                "     review_note = ?, reject_reason = NULL"
+                " WHERE id = ? AND status = 'pending'",
+                (data.reviewer, reviewed_at, data.note, application_id))
+        row = conn.execute(
+            "SELECT * FROM label_applications WHERE id = ?",
+            (application_id,)).fetchone()
+        return _label_application_view(conn, row)
+
+
+def get_label_application(conn: sqlite3.Connection, application_id: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM label_applications WHERE id = ?",
+        (application_id,)).fetchone()
+    if not row:
+        raise NotFound(f"未知标签签发申请: {application_id}")
+    return _label_application_view(conn, row)
+
+
+def list_label_applications(conn: sqlite3.Connection,
+                            status: str | None = None,
+                            batch_id: str | None = None) -> list[dict]:
+    """列出签发申请（可按 status=pending/approved/rejected/issued 与批次过滤），
+    列表不附带 current（避免逐行实时重算）；单条查询含当前状态对比。"""
+    if status not in (None, "pending", "approved", "rejected", "issued"):
+        raise BadRequest(
+            "status 仅支持 pending / approved / rejected / issued")
+    sql = "SELECT * FROM label_applications"
+    where, params = [], []
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if batch_id:
+        where.append("batch_id = ?")
+        params.append(batch_id)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id"
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [_label_application_view(conn, r, include_live=False) for r in rows]
